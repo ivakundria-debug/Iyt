@@ -1,0 +1,532 @@
+name: Build Miyu APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p Miyu/$(dirname app/build.gradle.kts)
+          cat > Miyu/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.miyu"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.miyu"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p Miyu/$(dirname app/src/main/AndroidManifest.xml)
+          cat > Miyu/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Рина"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FOREGROUND_SERVICE_SUBTYPE"
+                          android:value="Анимированный персонаж поверх экрана" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p Miyu/$(dirname app/src/main/java/com/example/miyu/MainActivity.kt)
+          cat > Miyu/app/src/main/java/com/example/miyu/MainActivity.kt <<'EOF'
+          package com.example.miyu
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val info = TextView(this).apply {
+                      text = "Рина гуляет и прыгает поверх экрана. Перетащи её пальцем, коснись — подпрыгнет."
+                      textSize = 16f
+                      setPadding(0, 0, 0, pad)
+                  }
+                  val on = Button(this).apply {
+                      text = "Показать Рину"
+                      setOnClickListener { start() }
+                  }
+                  val off = Button(this).apply {
+                      text = "Убрать Рину"
+                      setOnClickListener { stopService(Intent(this@MainActivity, OverlayService::class.java)) }
+                  }
+                  root.addView(info)
+                  root.addView(on)
+                  root.addView(off)
+                  setContentView(root)
+              }
+
+              private fun start() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  startForegroundService(Intent(this, OverlayService::class.java))
+              }
+          }
+          EOF
+          mkdir -p Miyu/$(dirname app/src/main/java/com/example/miyu/MiyuView.kt)
+          cat > Miyu/app/src/main/java/com/example/miyu/MiyuView.kt <<'EOF'
+          package com.example.miyu
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.os.SystemClock
+          import android.view.View
+          import java.util.Random
+          import kotlin.math.min
+
+          /** Рисует Рину на Canvas: прыжки, моргание, ходьба, радость при касании. */
+          class MiyuView(ctx: Context) : View(ctx) {
+              var facing = 1
+              var walking = false
+                  set(v) {
+                      if (v && !field) nextHop = 0L
+                      field = v
+                  }
+
+              private var jumpStart = 0L
+              private var jumpDur = 600L
+              private var amp = 0.1f
+              private var nextHop = 0L
+              private var happyUntil = 0L
+              private val rnd = Random()
+              private val rect = RectF()
+              private val path = Path()
+
+              private fun fill(c: Long) = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = c.toInt(); style = Paint.Style.FILL }
+              private val hair = fill(0xFFE85D75)
+              private val hairEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0xFFB03A55.toInt(); style = Paint.Style.STROKE; strokeWidth = 1.2f
+              }
+              private val skin = fill(0xFFFFE3D6)
+              private val white = fill(0xFFFFFFFF)
+              private val navy = fill(0xFF35418C)
+              private val red = fill(0xFFFF4F7B)
+              private val pink = fill(0xFFFF6F9C)
+              private val blush = fill(0x66FF7F9E)
+              private val iris = fill(0xFF2E9E8F)
+              private val dark = fill(0xFF14183C)
+              private val shoe = fill(0xFF3B2559)
+              private val bikini = fill(0xFF2EC4D6)
+              private val flower = fill(0xFFFF4F7B)
+              private val yellow = fill(0xFFFFD84A)
+              private val strap = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeWidth = 1f; color = 0xFF2EC4D6.toInt()
+              }
+              private val lash = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = 1.3f; color = 0xFF3B2559.toInt()
+              }
+              private val lip = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = 1.4f; color = 0xFFD43F63.toInt()
+              }
+              private val shadow = fill(0x44000000)
+              private val mouthFill = fill(0xFFC4506A)
+              private val heart = fill(0xFFFF4F7B).apply { textSize = 10f }
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = 1.6f; color = 0xFF3B2559.toInt()
+              }
+              private val arm = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeWidth = 4f; color = 0xFFFFE3D6.toInt()
+              }
+
+              fun bigJump() {
+                  val n = SystemClock.uptimeMillis()
+                  jumpStart = n
+                  jumpDur = 800
+                  amp = 0.3f
+                  happyUntil = n + 1600
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val now = SystemClock.uptimeMillis()
+                  if (now >= jumpStart + jumpDur && now >= nextHop) {
+                      jumpStart = now
+                      if (walking) {
+                          jumpDur = 380; amp = 0.07f; nextHop = now + jumpDur
+                      } else {
+                          jumpDur = 600; amp = 0.1f; nextHop = now + jumpDur + 900 + rnd.nextInt(1800)
+                      }
+                  }
+                  val s = min(width / 100f, height / 170f)
+                  val p = ((now - jumpStart).toFloat() / jumpDur).coerceIn(0f, 1f)
+                  val lift = if (p < 1f) 4f * p * (1f - p) * amp * 130f else 0f
+                  val sq = if (p < 1f && (p < 0.1f || p > 0.9f)) 0.06f else 0f
+
+                  c.save()
+                  c.translate((width - 100 * s) / 2f, height - 170 * s)
+                  c.scale(s, s)
+                  val sw = 22f * (1f - lift / 80f)
+                  rect.set(50f - sw, 163f, 50f + sw, 168.5f)
+                  c.drawOval(rect, shadow)
+                  c.translate(0f, -lift)
+                  c.scale(1f + sq, 1f - sq, 50f, 167f)
+                  c.scale(facing.toFloat(), 1f, 50f, 0f)
+                  c.translate(0f, 40f)
+                  drawGirl(c, now)
+                  c.restore()
+                  postInvalidateOnAnimation()
+              }
+
+              private fun drawGirl(c: Canvas, now: Long) {
+                  val happy = now < happyUntil
+                  // длинные волосы сзади
+                  rect.set(27f, 8f, 73f, 98f); c.drawOval(rect, hair)
+                  // шея и торс
+                  rect.set(46f, 38f, 54f, 50f); c.drawRect(rect, skin)
+                  path.reset()
+                  path.moveTo(37f, 50f); path.lineTo(63f, 50f)
+                  path.quadTo(60f, 66f, 57f, 74f)
+                  path.quadTo(66f, 84f, 64f, 92f)
+                  path.lineTo(36f, 92f)
+                  path.quadTo(34f, 84f, 43f, 74f)
+                  path.quadTo(40f, 66f, 37f, 50f)
+                  path.close()
+                  c.drawPath(path, skin)
+                  // ноги и обувь
+                  rect.set(37f, 88f, 49f, 123f); c.drawRoundRect(rect, 5f, 5f, skin)
+                  rect.set(51f, 88f, 63f, 123f); c.drawRoundRect(rect, 5f, 5f, skin)
+                  rect.set(36f, 120f, 49f, 127f); c.drawOval(rect, shoe)
+                  rect.set(51f, 120f, 64f, 127f); c.drawOval(rect, shoe)
+                  // руки
+                  if (happy) {
+                      c.drawLine(37f, 52f, 29f, 74f, arm)
+                      c.drawLine(63f, 52f, 72f, 40f, arm)
+                      c.drawLine(72f, 40f, 78f, 28f, arm)
+                  } else {
+                      c.drawLine(37f, 52f, 29f, 74f, arm)
+                      c.drawLine(63f, 52f, 71f, 74f, arm)
+                  }
+                  // купальник
+                  path.reset(); path.moveTo(36f, 86f); path.lineTo(64f, 86f); path.lineTo(51f, 100f); path.lineTo(49f, 100f); path.close()
+                  c.drawPath(path, bikini)
+                  rect.set(38f, 57f, 49f, 67f); c.drawOval(rect, bikini)
+                  rect.set(51f, 57f, 62f, 67f); c.drawOval(rect, bikini)
+                  c.drawLine(43f, 57f, 47f, 48f, strap)
+                  c.drawLine(57f, 57f, 53f, 48f, strap)
+                  c.drawLine(49f, 62f, 51f, 62f, strap)
+                  // голова и румянец
+                  c.drawCircle(50f, 26f, 17f, skin)
+                  rect.set(35f, 29f, 41f, 33f); c.drawOval(rect, blush)
+                  rect.set(59f, 29f, 65f, 33f); c.drawOval(rect, blush)
+                  // глаза
+                  val blink = now % 3800 < 140
+                  val xs = floatArrayOf(43f, 57f)
+                  for (i in 0..1) {
+                      val cx = xs[i]
+                      if (happy && i == 0) {
+                          rect.set(cx - 4.5f, 22f, cx + 4.5f, 30f)
+                          c.drawArc(rect, 200f, 140f, false, lash)
+                      } else {
+                          val ry = if (blink) 0.8f else 5f
+                          rect.set(cx - 4.2f, 26f - ry, cx + 4.2f, 26f + ry)
+                          c.drawOval(rect, white)
+                          if (!blink) {
+                              val ox = if (walking) 1f else 0f
+                              rect.set(cx - 3.2f + ox, 22f, cx + 3.2f + ox, 30.5f)
+                              c.drawOval(rect, iris)
+                              c.drawCircle(cx + ox, 26.5f, 1.6f, dark)
+                              c.drawCircle(cx - 1.1f + ox, 24f, 1.1f, white)
+                          }
+                          rect.set(cx - 5.5f, 19.5f, cx + 5.5f, 31f)
+                          c.drawArc(rect, 200f, 140f, false, lash)
+                      }
+                  }
+                  // губы
+                  if (happy) {
+                      rect.set(47.5f, 31.5f, 52.5f, 35.5f); c.drawOval(rect, mouthFill)
+                  } else {
+                      rect.set(46f, 30f, 54f, 36f); c.drawArc(rect, 20f, 140f, false, lip)
+                  }
+                  // чёлка и боковые пряди
+                  path.reset()
+                  path.moveTo(32f, 28f)
+                  path.quadTo(29f, 5f, 50f, 7f)
+                  path.quadTo(71f, 5f, 68f, 28f)
+                  path.quadTo(62f, 16f, 54f, 14f)
+                  path.quadTo(50f, 22f, 46f, 14f)
+                  path.quadTo(38f, 16f, 32f, 28f)
+                  path.close()
+                  c.drawPath(path, hair)
+                  c.drawPath(path, hairEdge)
+                  rect.set(29f, 18f, 39f, 72f); c.drawOval(rect, hair)
+                  rect.set(61f, 18f, 71f, 72f); c.drawOval(rect, hair)
+                  // цветок в волосах
+                  c.drawCircle(66f, 13f, 5f, flower)
+                  c.drawCircle(66f, 13f, 2f, yellow)
+                  // сердечко
+                  if (happy) {
+                      val t = (now - (happyUntil - 1600)) / 1600f
+                      heart.alpha = (255 * (1f - t)).toInt().coerceIn(0, 255)
+                      c.drawText("♥", 70f, 8f - t * 8f, heart)
+                  }
+              }
+          }
+          EOF
+          mkdir -p Miyu/$(dirname app/src/main/java/com/example/miyu/OverlayService.kt)
+          cat > Miyu/app/src/main/java/com/example/miyu/OverlayService.kt <<'EOF'
+          package com.example.miyu
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.Icon
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import java.util.Random
+          import kotlin.math.abs
+          import kotlin.math.hypot
+
+          class OverlayService : Service() {
+              companion object {
+                  const val ACTION_STOP = "com.example.miyu.STOP"
+                  const val CHANNEL = "miyu"
+              }
+
+              private lateinit var wm: WindowManager
+              private lateinit var lp: WindowManager.LayoutParams
+              private var view: MiyuView? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private val rnd = Random()
+              private var target = -1
+              private var nextMove = 0L
+              private var pauseUntil = 0L
+              private var dragging = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) stopSelf()
+                  return START_NOT_STICKY
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  startForegroundNotification()
+                  addCharacter()
+                  handler.post(object : Runnable {
+                      override fun run() {
+                          step()
+                          handler.postDelayed(this, 16)
+                      }
+                  })
+              }
+
+              private fun startForegroundNotification() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CHANNEL, "Рина", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, OverlayService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val action = Notification.Action.Builder(
+                      Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel), "Выключить", stop
+                  ).build()
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setSmallIcon(android.R.drawable.btn_star_big_on)
+                      .setContentTitle("Рина на экране")
+                      .setContentText("Нажми «Выключить», чтобы убрать")
+                      .addAction(action)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun addCharacter() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val d = resources.displayMetrics
+                  val w = (120 * d.density).toInt()
+                  val h = (204 * d.density).toInt()
+                  lp = WindowManager.LayoutParams(
+                      w, h,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = (d.widthPixels - w) / 2
+                      y = d.heightPixels - h - (48 * d.density).toInt()
+                  }
+                  val v = MiyuView(this)
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
+                  var sx = 0f
+                  var sy = 0f
+                  var ox = 0
+                  var oy = 0
+                  v.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y
+                              dragging = false
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - sx
+                              val dy = e.rawY - sy
+                              if (!dragging && hypot(dx, dy) > slop) dragging = true
+                              if (dragging) {
+                                  lp.x = ox + dx.toInt()
+                                  lp.y = oy + dy.toInt()
+                                  wm.updateViewLayout(v, lp)
+                                  target = -1
+                                  v.walking = false
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!dragging) v.bigJump()
+                              dragging = false
+                              pauseUntil = SystemClock.uptimeMillis() + 5000
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+                  wm.addView(v, lp)
+                  view = v
+              }
+
+              private fun step() {
+                  val v = view ?: return
+                  val now = SystemClock.uptimeMillis()
+                  val d = resources.displayMetrics
+                  if (dragging || now < pauseUntil) {
+                      v.walking = false
+                      return
+                  }
+                  if (target < 0) {
+                      v.walking = false
+                      if (now >= nextMove) target = rnd.nextInt(d.widthPixels - lp.width + 1)
+                      return
+                  }
+                  val speed = (2.2f * d.density).toInt().coerceAtLeast(2)
+                  val dx = target - lp.x
+                  if (abs(dx) <= speed) {
+                      lp.x = target
+                      target = -1
+                      nextMove = now + 2500 + rnd.nextInt(4000)
+                      v.walking = false
+                  } else {
+                      lp.x += if (dx > 0) speed else -speed
+                      v.facing = if (dx > 0) 1 else -1
+                      v.walking = true
+                  }
+                  wm.updateViewLayout(v, lp)
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  view?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  view = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+          mkdir -p Miyu/$(dirname build.gradle.kts)
+          cat > Miyu/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p Miyu/$(dirname gradle.properties)
+          cat > Miyu/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+          mkdir -p Miyu/$(dirname settings.gradle.kts)
+          cat > Miyu/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Miyu"
+          include(":app")
+          EOF
+      - name: Accept licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+      - name: Build APK
+        working-directory: Miyu
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Miyu-apk
+          path: Miyu/app/build/outputs/apk/debug/app-debug.apk
